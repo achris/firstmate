@@ -60,6 +60,10 @@ fi
 # fmx_env_get lives in bin/fm-env-lib.sh, the single owner of .env parsing.
 # shellcheck source=bin/fm-env-lib.sh
 . "$_FM_X_LIB_DIR/fm-env-lib.sh"
+if ! command -v fm_pr_file_device >/dev/null 2>&1; then
+  # shellcheck source=bin/fm-pr-lib.sh
+  . "$_FM_X_LIB_DIR/fm-pr-lib.sh"
+fi
 
 fmx_poll_shim_content() {
   local home=$1 root=$2
@@ -76,11 +80,10 @@ fmx_single_link_file_valid() {
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
   if [ "$(uname)" = Darwin ]; then
     links=$(/usr/bin/stat -f %l "$file" 2>/dev/null) || return 1
-    device=$(/usr/bin/stat -f %d "$file" 2>/dev/null) || return 1
   else
     links=$(stat -c %h "$file" 2>/dev/null) || return 1
-    device=$(stat -c %d "$file" 2>/dev/null) || return 1
   fi
+  device=$(fm_pr_file_device "$file") || return 1
   [ "$links" = 1 ] || return 1
   [ -z "$expected_device" ] || [ "$device" = "$expected_device" ]
 }

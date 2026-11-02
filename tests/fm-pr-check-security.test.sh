@@ -122,6 +122,10 @@ state_snapshot() {
   )
 }
 
+fixture_on_overlay() {
+  [ "$(uname)" = Linux ] && [ "$(stat -f -c %t "$TMP_ROOT" 2>/dev/null)" = 794c7630 ]
+}
+
 make_case() {
   local name=$1 dir fakebin fake_root
   dir="$TMP_ROOT/$name"
@@ -1426,8 +1430,9 @@ test_postrename_poll_validation_revokes_and_retries() {
     for action in type mode device content; do
       # The device fault is injected by a fake stat on PATH; on Darwin the
       # device helper now calls /usr/bin/stat directly, so the fake can never
-      # fire there. Skip the device action on Darwin.
-      if [ "$action" = device ] && [ "$(uname)" = Darwin ]; then
+      # fire there. Skip the device action on Darwin, and on a fixture overlay,
+      # where the real mount proof outranks a faked device reading.
+      if [ "$action" = device ] && { [ "$(uname)" = Darwin ] || fixture_on_overlay; }; then
         continue
       fi
       dir=$(make_case "poll-final-$artifact-$action")
@@ -3474,6 +3479,68 @@ SH
   pass "poll retirement preserves a replacement authority record"
 }
 
+# Overlayfs across two filesystems with xino off reports a directory on its own
+# device and a file on a per-layer one. A real overlay in a private mount
+# namespace pins that a file in the directory is accepted while a bind-mounted
+# file stays refused, including one whose raw device equals a genuine file's.
+test_overlay_layer_device_keeps_foreign_file_refusal() {
+  local dir out
+  if [ "$(uname)" != Linux ] || ! command -v unshare >/dev/null 2>&1 \
+    || ! unshare -Urm mount -t tmpfs fm-probe / >/dev/null 2>&1; then
+    printf '# skip: no private mount namespace here, so the overlay device case is unverified\n'
+    return 0
+  fi
+  dir=$(make_case overlay-device)
+  cat > "$dir/overlay-case.sh" <<'SH'
+set -u
+root=$1 lab=$2
+mkdir -p "$lab/lower" "$lab/upper" "$lab/foreign" "$lab/merged"
+mount -t tmpfs lower "$lab/lower" && mount -t tmpfs upper "$lab/upper" \
+  && mount -t tmpfs foreign "$lab/foreign" || exit 3
+mkdir -p "$lab/lower/state" "$lab/upper/data" "$lab/upper/work"
+mount -t overlay overlay -o "lowerdir=$lab/lower,upperdir=$lab/upper/data,workdir=$lab/upper/work,xino=off" \
+  "$lab/merged" || exit 3
+. "$root/bin/fm-pr-lib.sh"
+state=$lab/merged/state
+for name in genuine foreign-mount sibling-mount linked; do
+  : > "$state/$name"
+  chmod 0600 "$state/$name"
+done
+ln "$state/linked" "$state/linked-2"
+: > "$lab/foreign/file"
+mkdir "$lab/merged/other"
+: > "$lab/merged/other/file"
+chmod 0600 "$lab/foreign/file" "$lab/merged/other/file"
+mount --bind "$lab/foreign/file" "$state/foreign-mount" || exit 3
+mount --bind "$lab/merged/other/file" "$state/sibling-mount" || exit 3
+device=$(fm_pr_file_device "$state")
+[ "$(stat -c %d "$state/genuine")" != "$device" ] || exit 4
+[ "$(stat -c %d "$state/sibling-mount")" = "$(stat -c %d "$state/genuine")" ] || exit 4
+for name in genuine foreign-mount sibling-mount linked; do
+  if fm_pr_private_file_valid "$state/$name" 600 "$device"; then
+    printf '%s=accept\n' "$name"
+  else
+    printf '%s=refuse\n' "$name"
+  fi
+done
+SH
+  out=$(unshare -Urm bash "$dir/overlay-case.sh" "$ROOT" "$dir/lab" 2>&1)
+  case $? in
+    0) ;;
+    3)
+      printf '# skip: this kernel refused the overlay fixture mounts, so the overlay device case is unverified\n'
+      return 0
+      ;;
+    4) fail "overlay fixture did not produce the divergent devices it pins" ;;
+    *) fail "overlay device case failed: $out" ;;
+  esac
+  [ "$out" = "genuine=accept
+foreign-mount=refuse
+sibling-mount=refuse
+linked=refuse" ] || fail "overlay device verdicts were wrong: $out"
+  pass "overlay layer device accepts its own files and refuses mounted ones"
+}
+
 # A volume remount can renumber the state filesystem's st_dev while every inode
 # and byte stays put, as APFS does across a reboot. This rewrites a published
 # registration's recorded device the way that leaves it, changing no other
@@ -3575,8 +3642,10 @@ test_device_rerecord_refuses_tampered_artifacts() {
     # A regular file cannot sit on another device than its own directory without
     # a file mount, which Darwin does not offer, and Darwin's device helper reads
     # /usr/bin/stat directly, so no PATH fake can stand in there.
-    if [ "$mutation" = foreign-device ] && [ "$(uname)" = Darwin ]; then
-      exercised="$exercised (foreign-device not exercisable on Darwin)"
+    # On a fixture overlay the real mount proof outranks a faked device reading,
+    # and test_overlay_layer_device_keeps_foreign_file_refusal uses real mounts.
+    if [ "$mutation" = foreign-device ] && { [ "$(uname)" = Darwin ] || fixture_on_overlay; }; then
+      exercised="$exercised (foreign-device not exercisable here)"
       continue
     fi
     exercised="$exercised $mutation"
@@ -3830,6 +3899,7 @@ test_atomic_interruption_leaves_no_partial_artifact
 test_concurrent_watcher_sees_only_complete_publication
 test_poll_publication_refuses_unsafe_destinations
 test_live_artifact_single_link_and_privacy_validation
+test_overlay_layer_device_keeps_foreign_file_refusal
 test_device_renumbered_poll_stays_armed
 test_device_rerecord_refuses_tampered_artifacts
 test_device_rerecord_serializes_direct_rearm

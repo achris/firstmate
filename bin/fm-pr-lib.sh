@@ -376,12 +376,57 @@ fm_pr_file_mode() {
   fi
 }
 
+# The mount id the kernel reports for an open of <path>. Linux only; prints
+# nothing and fails when the path cannot be opened or /proc is unavailable.
+fm_pr_mount_id() {  # <path>
+  local key value
+  {
+    while IFS=: read -r key value; do
+      if [ "$key" = mnt_id ]; then
+        printf '%s\n' "${value//[[:space:]]/}"
+        return 0
+      fi
+    done < /proc/self/fdinfo/3
+  } 2>/dev/null 3< "$1"
+  return 1
+}
+
+# True only when <dir> is on overlayfs (magic 0x794c7630) and <file> is on that
+# same mount. A name inside a directory can only leave the directory's mount by
+# being a mount point itself, so an equal mount id is the exact proof that the
+# device comparison exists to approximate.
+fm_pr_same_overlay_mount() {  # <file> <dir>
+  local file_mount dir_mount
+  [ "$(stat -f -c %t "$2" 2>/dev/null)" = 794c7630 ] || return 1
+  file_mount=$(fm_pr_mount_id "$1") || return 1
+  dir_mount=$(fm_pr_mount_id "$2") || return 1
+  [ -n "$file_mount" ] && [ "$file_mount" = "$dir_mount" ]
+}
+
+# The device of a path, comparable with the device of its containing directory.
+# Overlayfs across more than one underlying filesystem, without xino, reports a
+# directory on its own device but a non-directory on a per-layer one, so a file
+# that truly lives in a directory can disagree with it. Such a file reports its
+# directory's device, and only after fm_pr_same_overlay_mount proves it is on
+# that directory's mount; anything else keeps its raw device and stays refused.
 fm_pr_file_device() {
+  local device parent parent_device
   if [ "$(uname)" = Darwin ]; then
     /usr/bin/stat -f %d "$1" 2>/dev/null
-  else
-    stat -c %d "$1" 2>/dev/null
+    return
   fi
+  device=$(stat -c %d "$1" 2>/dev/null) || return 1
+  if [ -f "$1" ] && [ ! -L "$1" ]; then
+    case "$1" in
+      */*) parent=${1%/*}/. ;;
+      *) parent=. ;;
+    esac
+    parent_device=$(stat -c %d "$parent" 2>/dev/null) || parent_device=$device
+    if [ "$parent_device" != "$device" ] && fm_pr_same_overlay_mount "$1" "$parent"; then
+      device=$parent_device
+    fi
+  fi
+  printf '%s\n' "$device"
 }
 
 fm_pr_file_link_count() {
